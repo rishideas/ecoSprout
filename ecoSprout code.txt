@@ -1,0 +1,192 @@
+#include <DHT.h>
+#include <DHT_U.h>
+#include "thingProperties.h"
+
+// Pin definitions
+#define LED_PIN 23
+#define MOTOR_PIN 22
+#define DHT_SENSOR_PIN 13
+#define BUTTON_LED_PIN 5
+#define BUTTON_MOTOR_PIN 18
+#define BUTTON_AUTO_PIN 19
+#define BUZZER_PIN 21
+#define DHT_SENSOR_TYPE DHT11
+
+// DHT sensor initialization
+DHT dht_sensor(DHT_SENSOR_PIN, DHT_SENSOR_TYPE);
+
+// Timing for periodic sensor readings
+unsigned long previousMillis = 0;
+const long interval = 2000; // 2 seconds
+
+// Thresholds for automation and alerts
+const float TEMP_THRESHOLD_MOTOR = 29.0; // Motor turns ON if temp > 29°C
+const float TEMP_THRESHOLD_LED = 26.0;   // LED turns ON if temp < 26°C
+const float TEMP_HIGH = 35.0;            // High-temperature threshold for alert
+const float TEMP_EMERGENCY = 45.0;       // Emergency temperature threshold
+
+// Buzzer timing for alerts
+const int BUZZER_NORMAL_INTERVAL = 500; // 500 ms ON/OFF for normal alert
+const int BUZZER_EMERGENCY_INTERVAL = 100; // 100 ms ON/OFF for emergency alert
+bool buzzerState = false;
+unsigned long lastBuzzerToggle = 0;
+
+// Button debounce
+bool lastButtonState_LED = LOW;
+unsigned long lastDebounceTime_LED = 0;
+
+bool lastButtonState_MOTOR = LOW;
+unsigned long lastDebounceTime_MOTOR = 0;
+
+bool lastButtonState_AUTO = LOW;
+unsigned long lastDebounceTime_AUTO = 0;
+
+// Temp variables to store button state
+bool local_led_switch = false;
+bool local_motor_switch = false;
+bool local_auto_mode = false;
+
+// Debounce delay
+const int debounceDelay = 50;
+
+void setup() {
+  // Pin modes
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(MOTOR_PIN, OUTPUT);
+  pinMode(BUTTON_LED_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_MOTOR_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_AUTO_PIN, INPUT_PULLUP);
+  pinMode(DHT_SENSOR_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // Initialize the DHT sensor
+  dht_sensor.begin();
+
+  // Initialize Serial and wait for the monitor
+  Serial.begin(9600);
+  delay(1500);
+
+  // Initialize IoT Cloud properties
+  initProperties();
+
+  // Connect to Arduino IoT Cloud
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+
+  // Debugging information
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();
+
+  // Default states
+  digitalWrite(LED_PIN, HIGH);   // LED OFF
+  digitalWrite(MOTOR_PIN, HIGH); // Motor OFF
+  digitalWrite(BUZZER_PIN, LOW); // Buzzer OFF
+
+  Serial.println("Setup completed.");
+}
+
+void loop() {
+  // Update IoT Cloud connection
+  ArduinoCloud.update();
+
+  // Read buttons and update local states
+  handleButtonPress(BUTTON_LED_PIN, lastButtonState_LED, lastDebounceTime_LED, local_led_switch, []() {
+    led_switch = local_led_switch;
+    onLedSwitchChange();
+  });
+
+  handleButtonPress(BUTTON_MOTOR_PIN, lastButtonState_MOTOR, lastDebounceTime_MOTOR, local_motor_switch, []() {
+    motor_switch = local_motor_switch;
+    onMotorSwitchChange();
+  });
+
+  handleButtonPress(BUTTON_AUTO_PIN, lastButtonState_AUTO, lastDebounceTime_AUTO, local_auto_mode, []() {
+    auto_mode = local_auto_mode;
+    onAutoModeChange();
+  });
+
+  // Periodic DHT sensor readings
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+    humi = dht_sensor.readHumidity();
+    temp = dht_sensor.readTemperature();
+
+    // Handle sensor errors
+    if (isnan(humi) || isnan(temp)) {
+      Serial.println("Failed to read from DHT Sensor. Retrying...");
+    } else {
+      Serial.print("Humidity: "); Serial.print(humi); Serial.print("% | ");
+      Serial.print("Temperature: "); Serial.print(temp); Serial.println("°C");
+
+      // Emergency and normal alert logic for buzzer
+      if (temp >= TEMP_EMERGENCY) {
+        handleBuzzer(currentMillis, BUZZER_EMERGENCY_INTERVAL);
+        Serial.println("Emergency Temperature! Rapid Buzzer Active.");
+      } else if (temp >= TEMP_HIGH) {
+        handleBuzzer(currentMillis, BUZZER_NORMAL_INTERVAL);
+        Serial.println("High Temperature! Periodic Buzzer Active.");
+      } else {
+        digitalWrite(BUZZER_PIN, LOW); // Ensure the buzzer is OFF
+        buzzerState = false;
+        Serial.println("Temperature Normal. Buzzer OFF.");
+      }
+
+      // Automated motor and LED control
+      if (auto_mode) {
+        motor_switch = temp > TEMP_THRESHOLD_MOTOR;
+        led_switch = temp < TEMP_THRESHOLD_LED;
+
+        onMotorSwitchChange();
+        onLedSwitchChange();
+      }
+    }
+  }
+}
+
+// Function to handle buzzer activation
+void handleBuzzer(unsigned long currentMillis, int buzzerInterval) {
+  if (currentMillis - lastBuzzerToggle >= buzzerInterval) {
+    buzzerState = !buzzerState; // Toggle buzzer state
+    digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+    lastBuzzerToggle = currentMillis;
+  }
+}
+
+// Button handling with debounce
+void handleButtonPress(int buttonPin, bool &lastButtonState, unsigned long &lastDebounceTime, bool &controlVariable, void (*callback)()) {
+  bool reading = digitalRead(buttonPin);
+
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (reading != controlVariable) {
+      controlVariable = reading;
+      callback();
+    }
+  }
+
+  lastButtonState = reading;
+}
+
+void onLedSwitchChange() {
+  digitalWrite(LED_PIN, led_switch ? LOW : HIGH); // LOW = ON, HIGH = OFF
+  Serial.println(led_switch ? "LED ON" : "LED OFF");
+}
+
+void onMotorSwitchChange() {
+  digitalWrite(MOTOR_PIN, motor_switch ? LOW : HIGH); // LOW = ON, HIGH = OFF
+  Serial.println(motor_switch ? "Motor ON" : "Motor OFF");
+}
+
+void onAutoModeChange() {
+  Serial.println(auto_mode ? "Auto Mode Enabled" : "Auto Mode Disabled");
+  if (!auto_mode) {
+    // Turn off motor and LED when exiting Auto Mode
+    motor_switch = false;
+    led_switch = false;
+    onMotorSwitchChange();
+    onLedSwitchChange();
+  }
+}
